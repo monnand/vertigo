@@ -7,7 +7,6 @@ import (
 	"io"
 	"os/exec"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -19,6 +18,7 @@ type gceVmManager struct {
 const (
 	gcutil_OP_ADD = iota
 	gcutil_OP_DEL
+	gcutil_OP_ADD_TO_POOL
 )
 
 type gcutilOperation int
@@ -29,6 +29,8 @@ func (self gcutilOperation) String() string {
 		return "addinstance"
 	case gcutil_OP_DEL:
 		return "deleteinstance"
+	case gcutil_OP_ADD_TO_POOL:
+		return "addtargetpoolinstance"
 	}
 	return ""
 }
@@ -40,6 +42,7 @@ type gcutlCmdParams struct {
 	Zone        string
 	MachineType string
 	Image       string
+	TargetPool  string
 }
 
 func randomUniqString() string {
@@ -51,7 +54,7 @@ func randomUniqString() string {
 
 func (self *gcutlCmdParams) fillDefault() {
 	if self.Name == "" {
-		self.Name = fmt.Sprintf("virtigo-%v", randomUniqString())
+		self.Name = fmt.Sprintf("vertigo-%v", randomUniqString())
 	}
 	if self.Zone == "" {
 		self.Zone = "us-central1-a"
@@ -61,6 +64,9 @@ func (self *gcutlCmdParams) fillDefault() {
 	}
 	if self.Image == "" {
 		self.Image = "ubuntu-trusty"
+	}
+	if self.TargetPool == "" {
+		self.TargetPool = "vertigo-lb-pool"
 	}
 }
 
@@ -73,11 +79,16 @@ func (self *gcutlCmdParams) ToParamList() []string {
 		ret = append(ret, fmt.Sprintf("--zone=%v", self.Zone))
 		ret = append(ret, fmt.Sprintf("--machine_type=%v", self.MachineType))
 		ret = append(ret, fmt.Sprintf("--image=%v", self.Image))
+		ret = append(ret, self.Name)
 	case gcutil_OP_DEL:
 		ret = append(ret, "-f")
 		ret = append(ret, "--nodelete_boot_pd")
+		ret = append(ret, self.Name)
+	case gcutil_OP_ADD_TO_POOL:
+		ret = append(ret, fmt.Sprintf("--instances=%v", self.Name))
+		ret = append(ret, "--region=us-central1")
+		ret = append(ret, self.TargetPool)
 	}
-	ret = append(ret, self.Name)
 	return ret
 }
 
@@ -97,12 +108,18 @@ func infoToDelInstanceCmd(info *VirtualMachineInfo) *gcutlCmdParams {
 	}
 }
 
-func (self *gceVmManager) runGcutil(params *gcutlCmdParams) error {
-	wg := &sync.WaitGroup{}
-	wg.Add(1)
+func specToAddToTargetPool(spec *VirtualMachineSpec) *gcutlCmdParams {
+	return &gcutlCmdParams{
+		Op:    gcutil_OP_ADD_TO_POOL,
+		Name:  spec.Name,
+		Image: spec.Image,
+	}
+}
+
+func (self *gceVmManager) runGcutil(params *gcutlCmdParams, timeout time.Duration) error {
+	ch := make(chan bool)
 	var err error
 	go func() {
-		defer wg.Done()
 		paramList := params.ToParamList()
 		gcutil := self.gcutilPath
 		if self.gcutilPath == "" {
@@ -111,8 +128,16 @@ func (self *gceVmManager) runGcutil(params *gcutlCmdParams) error {
 		fmt.Printf("%v %v\n", gcutil, strings.Join(paramList, " "))
 		cmd := exec.Command(gcutil, paramList...)
 		err = cmd.Run()
+		ch <- true
 	}()
-	wg.Wait()
+	if timeout.Seconds() > 1.0 {
+		select {
+		case <-time.After(timeout):
+		case <-ch:
+		}
+	} else {
+		<-ch
+	}
 	if err != nil {
 		return fmt.Errorf("unable to use gcutil: %v", err)
 	}
@@ -121,19 +146,26 @@ func (self *gceVmManager) runGcutil(params *gcutlCmdParams) error {
 
 func (self *gceVmManager) NewMachine(spec *VirtualMachineSpec) (*VirtualMachineInfo, error) {
 	params := specToAddInstanceCmd(spec)
-	err := self.runGcutil(params)
+	err := self.runGcutil(params, 0*time.Second)
 	if err != nil {
 		return nil, err
 	}
 	info := &VirtualMachineInfo{
 		Name: params.Name,
 	}
+
+	params = specToAddToTargetPool(spec)
+	params.Name = info.Name
+	err = self.runGcutil(params, 30*time.Second)
+	if err != nil {
+		return nil, err
+	}
 	return info, nil
 }
 
 func (self *gceVmManager) DelMachine(info *VirtualMachineInfo) error {
 	params := infoToDelInstanceCmd(info)
-	err := self.runGcutil(params)
+	err := self.runGcutil(params, 0*time.Second)
 	if err != nil {
 		return err
 	}
